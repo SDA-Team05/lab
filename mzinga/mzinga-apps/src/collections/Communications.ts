@@ -25,7 +25,7 @@ const Communications: CollectionConfig = {
   admin: {
     ...collectionUtils.GeneratePreviewConfig(),
     useAsTitle: "subject",
-    defaultColumns: ["subject", "tos"],
+    defaultColumns: ["subject", "tos", "status"],
     group: "Notifications",
     disableDuplicate: true,
     enableRichTextRelationship: false,
@@ -33,13 +33,23 @@ const Communications: CollectionConfig = {
   hooks: {
     afterChange: [
       async ({ doc }) => {
+        if (process.env.COMMUNICATIONS_EXTERNAL_WORKER === "true") {
+          if (doc.status !== "pending") {
+            await payload.update({
+              collection: Slugs.Communications,
+              id: doc.id,
+              data: { status: "pending" },
+            });
+          }
+          return doc; 
+        }
         const { tos, ccs, bccs, subject, body } = doc;
-        for (const part of body) {
-          if (part.type !== "upload") {
+        for (const part of body) {                        // Nei CMS headless, il body è sempre un array
+          if (part.type !== "upload") {                   
             continue;
           }
           const relationToSlug = part.relationTo;
-          const doc = await payload.findByID({
+          const doc = await payload.findByID({            
             collection: relationToSlug,
             id: part.value.id,
           });
@@ -48,22 +58,22 @@ const Communications: CollectionConfig = {
             ...doc,
           };
         }
-        const html = TextUtils.Serialize(body || "");
+        const html = TextUtils.Serialize(body || "");      // La funzione TextUtils.Serialize converte il body in HTML
         try {
           const users = await payload.find({
-            collection: tos[0].relationTo,
+            collection: tos[0].relationTo,                 // Recupera l'id dei destinatari (tos) 
             where: {
               id: {
                 in: tos.map((to) => to.value.id || to.value).join(","),
               },
             },
           });
-          const usersEmails = users.docs.map((u) => u.email);
+          const usersEmails = users.docs.map((u) => u.email);   // Recupera le email corrispondenti a quegli id
           if (!usersEmails.length) {
-            throw new Error("No valid email addresses found for 'tos' users.");
+            throw new Error("No valid email addresses found for 'tos' users.");   // Se non ci sono destinatari validi, lancia un errore
           }
           let cc;
-          if (ccs) {
+          if (ccs) {                                            // Stesso processo per i cc, se ci sono
             const copiedusers = await payload.find({
               collection: ccs[0].relationTo,
               where: {
@@ -75,7 +85,7 @@ const Communications: CollectionConfig = {
             cc = copiedusers.docs.map((u) => u.email).join(",");
           }
           let bcc;
-          if (bccs) {
+          if (bccs) {                                           // Stesso processo per i bcc, se ci sono
             const blindcopiedusers = await payload.find({
               collection: bccs[0].relationTo,
               where: {
@@ -211,6 +221,20 @@ const Communications: CollectionConfig = {
       name: "body",
       type: "richText",
       required: true,
+    },
+    {
+      name: "status",
+      type: "select",
+      options: [
+        { label: "Pending", value: "pending" },
+        { label: "Processing", value: "processing" },
+        { label: "Sent", value: "sent" },
+        { label: "Failed", value: "failed" }
+      ],
+      admin: {
+        readOnly: true,
+        position: "sidebar", 
+      },
     },
   ],
 };
