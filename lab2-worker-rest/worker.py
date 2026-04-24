@@ -3,17 +3,19 @@ import time
 import logging
 import requests
 import smtplib
-from email.message import EmailMessage
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from dotenv import load_dotenv
 
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 API_URL = os.getenv("MZINGA_API_URL")
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", 5))
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "5"))
 SMTP_HOST = os.getenv("SMTP_HOST")
 SMTP_PORT = int(os.getenv("SMTP_PORT", 1025))
 EMAIL_FROM = os.getenv("EMAIL_FROM")
@@ -21,40 +23,49 @@ EMAIL_FROM = os.getenv("EMAIL_FROM")
 current_token = None
 
 def get_auth_token():
-    """Fa il login su MZinga e restituisce il token JWT."""
+    """Gets a new authentication token using admin credentials."""
     url = f"{API_URL}/api/users/login"
     payload = {"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}
     response = requests.post(url, json=payload)
     response.raise_for_status()
     return response.json().get("token")
 
-def serialize_slate_to_html(nodes):
-    """Converte il formato Slate in HTML (identico al Lab 1)."""
-    if not nodes: return ""
+def slate_to_html(nodes):
+    """Recursively converts Slate AST nodes to HTML string."""
     html = ""
     for node in nodes:
         if "text" in node:
             text = node["text"]
-            if node.get("bold"): text = f"<strong>{text}</strong>"
-            if node.get("italic"): text = f"<em>{text}</em>"
-            if node.get("underline"): text = f"<u>{text}</u>"
+            if node.get("bold"):
+                text = f"<b>{text}</b>"
+            if node.get("italic"):
+                text = f"<i>{text}</i>"
             html += text
-        elif "children" in node:
-            children_html = serialize_slate_to_html(node["children"])
-            tag = "p"
-            if node.get("type") == "h1": tag = "h1"
-            elif node.get("type") == "h2": tag = "h2"
-            elif node.get("type") == "ul": tag = "ul"
-            elif node.get("type") == "ol": tag = "ol"
-            elif node.get("type") == "li": tag = "li"
-            elif node.get("type") == "link":
-                html += f'<a href="{node.get("url")}">{children_html}</a>'
-                continue
-            html += f"<{tag}>{children_html}</{tag}>"
+            continue
+
+        node_type = node.get("type")
+        children_html = slate_to_html(node.get("children", []))
+
+        if node_type == "paragraph":
+            html += f"<p>{children_html}</p>"
+        elif node_type == "h1":
+            html += f"<h1>{children_html}</h1>"
+        elif node_type == "h2":
+            html += f"<h2>{children_html}</h2>"
+        elif node_type == "ul":
+            html += f"<ul>{children_html}</ul>"
+        elif node_type == "li":
+            html += f"<li>{children_html}</li>"
+        elif node_type == "link":
+            url = node.get("url", "#")
+            html += f'<a href="{url}">{children_html}</a>'
+        else:
+            html += children_html
+            
     return html
 
 def api_request(method, endpoint, data=None):
-    """Fa una chiamata API. Se il token scade (401), fa un nuovo login e riprova."""
+    """Makes an API request. If the token expires (401), logs in again and retries."""
     global current_token
     if not current_token:
         current_token = get_auth_token()
@@ -73,69 +84,85 @@ def api_request(method, endpoint, data=None):
     response.raise_for_status()
     return response.json()
 
-def process_communication(doc):
-    """Invia fisicamente l'email tramite MailHog."""
-    doc_id = doc["id"]
-    logging.info(f"Processing Communication ID: {doc_id}")
+def resolve_emails(refs):
+    """Resolves Payload relationship references to email addresses."""
+    if not refs or not isinstance(refs, list):
+        return []
     
-    api_request("PATCH", f"/api/communications/{doc_id}", {"status": "processing"})
+    emails = []
+    for ref in refs:
+        # Now value includes the user data directly due to depth=1
+        if isinstance(ref, dict) and ref.get("relationTo") == "users":
+            user_data = ref.get("value")
+            if isinstance(user_data, dict) and "email" in user_data:
+                emails.append(user_data["email"])
+    return emails
+
+
+def send_email(to_list, cc_list, bcc_list, subject, html_body):
+    """Sends email using standard smtplib."""
+    msg = MIMEMultipart()
+    msg["Subject"] = subject
+    msg["From"] = EMAIL_FROM
+    msg["To"] = ", ".join(to_list)
+    if cc_list:
+        msg["Cc"] = ", ".join(cc_list)
     
-    try:
-        msg = EmailMessage()
-        msg['Subject'] = doc.get("subject", "No Subject")
-        msg['From'] = EMAIL_FROM
-        
-        def extract_emails(field):
-            return [item["value"]["email"] for item in doc.get(field, []) if "value" in item and "email" in item["value"]]
-            
-        tos = extract_emails("tos")
-        if not tos:
-            raise ValueError("No recipients found in 'tos'")
-            
-        msg['To'] = ", ".join(tos)
-        
-        ccs = extract_emails("ccs")
-        if ccs: msg['Cc'] = ", ".join(ccs)
-        
-        bccs = extract_emails("bccs")
-        if bccs: msg['Bcc'] = ", ".join(bccs)
-
-        html_body = serialize_slate_to_html(doc.get("body", []))
-        msg.set_content("Please view this email in an HTML compatible client.")
-        msg.add_alternative(html_body, subtype='html')
-
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.send_message(msg)
-            
-        api_request("PATCH", f"/api/communications/{doc_id}", {"status": "sent"})
-        logging.info(f"Successfully sent: {doc_id}")
-        
-    except Exception as e:
-        logging.error(f"Error processing {doc_id}: {e}")
-        api_request("PATCH", f"/api/communications/{doc_id}", {"status": "failed"})
-
-def run_worker():
-    global current_token
-    try:
-        current_token = get_auth_token()
-        logging.info("Worker authenticated successfully. Polling API...")
-    except Exception as e:
-        logging.error(f"Failed initial login: {e}")
+    msg.attach(MIMEText(html_body, "html"))
+    
+    all_recipients = to_list + cc_list + bcc_list
+    
+    if not all_recipients:
+        logger.warning("No recipients found. Skipping SMTP send.")
         return
 
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.send_message(msg, to_addrs=all_recipients)
+
+def run_worker():
+    logger.info(f"Worker connected to API. Polling every {POLL_INTERVAL_SECONDS}s...")
+    
     while True:
         try:
-            response = api_request("GET", "/api/communications?where[status][equals]=pending&depth=1")
+            # Get pending documents
+            query = "/api/communications?where[status][equals]=pending&sort=createdAt&limit=1&depth=1"
+            response = api_request("GET", query)
             docs = response.get("docs", [])
-            
-            for doc in docs:
-                process_communication(doc)
-                
-            time.sleep(POLL_INTERVAL)
-            
+
+            if not docs:
+                time.sleep(POLL_INTERVAL_SECONDS)
+                continue
+
+            doc = docs[0]
+            doc_id = doc["id"]
+
+            try:
+                logger.info(f"Processing Communication ID: {doc_id}")
+
+                # Mark communication status as processing
+                api_request("PATCH", f"/api/communications/{doc_id}", {"status": "processing"})
+
+                tos = resolve_emails(doc.get("tos", []))
+                ccs = resolve_emails(doc.get("ccs", []))
+                bccs = resolve_emails(doc.get("bccs", []))
+
+                html_content = slate_to_html(doc.get("body", []))
+
+                send_email(tos, ccs, bccs, doc.get("subject", "(No Subject)"), html_content)
+
+                api_request("PATCH", f"/api/communications/{doc_id}", {"status": "sent"})
+                logger.info(f"Successfully sent: {doc_id}")
+
+            except Exception as e:
+                logger.error(f"Error processing {doc_id}: {e}")
+                api_request("PATCH", f"/api/communications/{doc_id}", {
+                    "status": "failed", 
+                    "error": str(e)
+                })
+
         except Exception as e:
-            logging.error(f"Error during polling: {e}")
-            time.sleep(POLL_INTERVAL)
+            logger.error(f"Error during polling loop: {e}")
+            time.sleep(POLL_INTERVAL_SECONDS)
 
 if __name__ == "__main__":
     run_worker()
